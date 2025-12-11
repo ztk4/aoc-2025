@@ -1,0 +1,11 @@
+[package]
+name = "libaoc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+color-eyre = "0.6.5"
+futures = "0.3.31"
+itertools = "0.14.0"
+smol = "2.0.2"

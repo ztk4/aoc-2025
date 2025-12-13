@@ -42,6 +42,8 @@ pub struct Config<T: clap::Args = EmptyChallengeArgs> {
   pub part: Part,
   /// The file to read input from (buffered as a best-practice).
   pub input: std::io::BufReader<std::fs::File>,
+  /// The local directory for this day's challenge.
+  pub local_dir: std::path::PathBuf,
   /// Custom challenge-specific arguments (if specified).
   pub challenge_args: T,
 }
@@ -66,6 +68,7 @@ impl<T: clap::Args> Config<T> {
         std::fs::File::open_buffered(path.as_path())
           .wrap_err_with(|| format!("Bad path: {}", path.display()))?
       },
+      local_dir,
       challenge_args: args.challenge_args,
     })
   }

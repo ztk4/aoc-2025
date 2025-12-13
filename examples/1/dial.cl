@@ -23,9 +23,7 @@ __kernel void accumulate_local(__global uint* buffer, uint length, uint modulus,
 __kernel void accumulate_global(__global uint* buffer, uint length,
                                 uint modulus, __global const uint* group_sums,
                                 __local uint* scratch) {
-  // Get max sums from accumulate_local from all groups strictly less than this
-  // one. NOTE: We have to handle the case where local_size < ngroups -> hence
-  // the loop.
+  // Get accumulate_local sums from all groups strictly less than this one.
   for (int i = get_local_id(0); i < get_group_id(0); i += get_local_size(0)) {
     scratch[i] = group_sums[i];
   }
@@ -48,8 +46,7 @@ __kernel void accumulate_global(__global uint* buffer, uint length,
 
 __kernel void count(__global const uint* input, uint length, uint value,
                     __global uint* output, __local uint* scratch) {
-  // Defaulting to ~value to a) avoid UB and b) avoid counting these as matches
-  // for value!
+  // Defaulting to ~value to a) avoid UB and b) avoid counting these as matches!
   scratch[get_local_id(0)] =
       get_global_id(0) < length ? input[get_global_id(0)] : ~value;
   barrier(CLK_LOCAL_MEM_FENCE);

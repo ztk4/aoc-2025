@@ -6,11 +6,18 @@ use log::*;
 use ocl::*;
 use std::fs;
 
+#[derive(clap::Args)]
+struct Options {
+  /// Whether to print OpenCL config info.
+  #[arg(long, default_value_t = false)]
+  show_config: bool,
+}
+
 fn main() -> Result<()> {
   env_logger::init();
   color_eyre::install()?;
 
-  let config = create_config!()?;
+  let config = create_config!(challenge_args: Options)?;
   info!(
     "Advent of Code day #{}, part {:?}!",
     config.day, config.part
@@ -26,6 +33,16 @@ fn main() -> Result<()> {
   let proque = ProQue::builder()
     .src(fs::read_to_string(config.local_dir.join("sum.cl"))?)
     .build()?;
+  // Let's print some info about the defaults proque uses!
+  if config.challenge_args.show_config {
+    println!("Context: {:#}", proque.context());
+    println!("Platform: {:#}", proque.context().platform()?.unwrap());
+    println!(
+      "Device 0: {:#}",
+      proque.context().get_device_by_wrapping_index(0)
+    );
+  }
+
   // Let's reduce first by row, and then to a final sum.
   let nrows = input.len();
   let flat: Vec<_> = input.into_iter().flatten().collect();

@@ -9,6 +9,7 @@
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Result, eyre};
 use futures::future::FutureExt; // How do you live without Future::then/map?
+use ocl::{Buffer, OclPrm};
 use smol::{LocalExecutor, channel, future};
 
 use std::any::type_name;
@@ -342,6 +343,16 @@ impl<T: Default> CellApplyExt<T> for std::cell::Cell<T> {
     self.set(t);
     r
   }
+}
+
+/// Helpers for working with ocl.
+
+/// Simple conversion of buffer to vector.
+/// NOTE: Performs a memory transfer from the GPU -> requires buf have a default queue.
+pub fn buf2vec<T: OclPrm>(buf: &Buffer<T>) -> Result<Vec<T>> {
+  let mut vec = vec![T::default(); buf.len()];
+  buf.read(&mut vec).enq()?;
+  Ok(vec)
 }
 
 /// Some minimal unit testing.

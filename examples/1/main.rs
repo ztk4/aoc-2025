@@ -154,9 +154,7 @@ fn main() -> Result<()> {
 
     sum_counts.enq()?;
   }
-  let mut count: i64 = 0;
-  result.read(std::slice::from_mut(&mut count)).enq()?;
-  println!("Password: {}", count);
+  println!("Password: {}", buf2vec(&result)?[0]);
 
   Ok(())
 }

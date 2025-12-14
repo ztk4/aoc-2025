@@ -93,9 +93,6 @@ fn main() -> Result<()> {
   }
 
   // We're using in-order execution above, so r/w to reduced and result should be syncrhonized.
-  let mut sum = 0u64;
-  result.read(std::slice::from_mut(&mut sum)).enq()?; // Blocking
-  println!("Sum: {}", sum);
-
+  println!("Sum: {}", buf2vec(&result)?[0]);
   Ok(())
 }

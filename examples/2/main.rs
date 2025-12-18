@@ -39,7 +39,6 @@ fn sum(
         .arg(&partial_sums)
         .arg(partial_sums.len())
         .arg(&new_partials)
-        .arg_local::<u64>(lws)
         .build()?,
     );
     partial_sums = new_partials;
@@ -97,7 +96,6 @@ impl IdRange {
       .arg(self.lo)
       .arg(self.hi)
       .arg(&partial_sums)
-      .arg_local::<u64>(lws)
       .build()?;
 
     unsafe {

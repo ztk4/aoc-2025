@@ -1,17 +1,10 @@
-//! Template example for starting a new day's challenge.
+//! AoC Day 1
 #![feature(result_flattening, macro_metavar_expr)]
 use color_eyre::eyre::{Result, eyre};
 use libaoc::*;
 use log::*;
 use ocl::*;
 use std::fs;
-
-#[derive(clap::Args)]
-struct Options {
-  /// Work group size for kernels.
-  #[arg(long)]
-  group_size: Option<usize>,
-}
 
 const DIAL_LENGTH: i64 = 100;
 const DIAL_INIT: i64 = 50;
@@ -20,7 +13,7 @@ fn main() -> Result<()> {
   env_logger::init();
   color_eyre::install()?;
 
-  let config = create_config!(challenge_args: Options)?;
+  let config = create_config!()?;
   info!(
     "Advent of Code day #{}, part {:?}!",
     config.day, config.part
@@ -40,11 +33,7 @@ fn main() -> Result<()> {
     ))
     .collect::<Result<_>>()?;
 
-  // Default to a group size of ~sqrt(N).
-  let local_size = config
-    .challenge_args
-    .group_size
-    .unwrap_or((rots.len() as f64).sqrt().ceil() as usize);
+  let local_size = config.group_size;
   let ngroups = (rots.len() as f64 / local_size as f64).ceil() as usize;
   let global_size = ngroups * local_size;
 

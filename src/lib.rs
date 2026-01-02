@@ -45,6 +45,9 @@ pub struct Config<T: clap::Args = EmptyChallengeArgs> {
   pub input: std::io::BufReader<std::fs::File>,
   /// The local directory for this day's challenge.
   pub local_dir: std::path::PathBuf,
+  /// Hints local work size for OpenCL.
+  /// NOTE: This parameter may be ignored.
+  pub group_size: usize,
   /// Custom challenge-specific arguments (if specified).
   pub challenge_args: T,
 }
@@ -70,6 +73,7 @@ impl<T: clap::Args> Config<T> {
           .wrap_err_with(|| format!("Bad path: {}", path.display()))?
       },
       local_dir,
+      group_size: args.group_size,
       challenge_args: args.challenge_args,
     })
   }
@@ -95,6 +99,11 @@ struct Args<T: clap::Args = EmptyChallengeArgs> {
   /// Input file, relative to the examples/ subdirectory for this day.
   #[arg(short, long)]
   input: String,
+
+  /// A hint for what local work size to use for OpenCL.
+  /// NOTE: This may be ignored.
+  #[arg(short, long, default_value_t = 1024)]
+  group_size: usize,
 
   /// Additional arguments supported by the specific AoC Chall.
   #[command(flatten)]

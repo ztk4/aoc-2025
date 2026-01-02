@@ -1,5 +1,4 @@
 //! AoC Day 2.
-//! NOTE: Running with `--group-size 64` works well on my machine.
 #![feature(result_flattening, macro_metavar_expr)]
 use color_eyre::eyre::{Result, eyre};
 use itertools::Itertools;
@@ -142,18 +141,11 @@ impl IdRange {
   }
 }
 
-#[derive(clap::Args)]
-struct Options {
-  /// Work group size for kernels.
-  #[arg(long)]
-  group_size: usize,
-}
-
 fn main() -> Result<()> {
   env_logger::init();
   color_eyre::install()?;
 
-  let config = create_config!(challenge_args: Options)?;
+  let config = create_config!()?;
   info!(
     "Advent of Code day #{}, part {:?}!",
     config.day, config.part
@@ -176,7 +168,7 @@ fn main() -> Result<()> {
     .devices(device)
     .src(fs::read_to_string(config.local_dir.join("product_ids.cl"))?)
     .build(&context)?;
-  let lws = config.challenge_args.group_size;
+  let lws = config.group_size;
 
   let invalid_sums: Vec<_> = ranges
     .into_iter()

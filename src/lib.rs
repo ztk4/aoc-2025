@@ -14,6 +14,7 @@ use smol::{LocalExecutor, channel, future};
 
 use std::any::type_name;
 use std::ops::{ControlFlow, FromResidual, Residual, Try};
+use std::slice::Iter;
 use std::str::{FromStr, Split, SplitWhitespace, pattern::Pattern};
 use std::string::String;
 
@@ -150,6 +151,7 @@ macro_rules! tuple_parse_tokens {
 pub enum DelimitedTokens<'src, P: Pattern> {
   FromSplit(Split<'src, P>),
   FromSplitWhitespace(SplitWhitespace<'src>),
+  FromBytes(Iter<'src, u8>),
 }
 impl<'src, P: Pattern> DelimitedTokens<'src, P> {
   /// Makes tokens by splitting on a separator.
@@ -157,10 +159,15 @@ impl<'src, P: Pattern> DelimitedTokens<'src, P> {
     Self::FromSplit(s.into().split(sep))
   }
 }
-impl<'src> DelimitedTokens<'src, /*a small valid Pattern*/ char> {
+impl<'src> DelimitedTokens<'src, [char; 0]> {
   /// Makes tokens by splitting on unicode whitespace.
   pub fn by_whitespace(s: impl Into<&'src str>) -> Self {
     Self::FromSplitWhitespace(s.into().split_whitespace())
+  }
+  /// Makes tokens from each individual ASCII character.
+  /// NOTE: A non-ASCII string will cause this to crash.
+  pub fn each_char(s: impl Into<&'src str>) -> Self {
+    Self::FromBytes(s.into().as_bytes().iter())
   }
 }
 impl<'src, P: Pattern> Iterator for DelimitedTokens<'src, P> {
@@ -170,6 +177,10 @@ impl<'src, P: Pattern> Iterator for DelimitedTokens<'src, P> {
     match self {
       DelimitedTokens::FromSplit(ref mut it) => it.next(),
       DelimitedTokens::FromSplitWhitespace(ref mut it) => it.next(),
+      DelimitedTokens::FromBytes(ref mut it) => it.next().map(|b| {
+        std::str::from_utf8(std::slice::from_ref(b))
+          .expect("DelimitedTokens::FromBytes requires each byte to be valid ASCII")
+      }),
     }
   }
 }

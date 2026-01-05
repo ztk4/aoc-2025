@@ -1,5 +1,6 @@
 //! AoC Day 3.
 #![feature(result_flattening, macro_metavar_expr)]
+use clap::Args;
 use color_eyre::eyre::Result;
 use libaoc::*;
 use log::*;
@@ -52,11 +53,18 @@ impl Bank {
   }
 }
 
+#[derive(Args)]
+struct Options {
+  /// Whether to use the original algorithm for part 1.
+  #[arg(long, default_value_t = false)]
+  orig: bool,
+}
+
 fn main() -> Result<()> {
   env_logger::init();
   color_eyre::install()?;
 
-  let config = create_config!()?;
+  let config = create_config!(challenge_args: Options)?;
   info!(
     "Advent of Code day #{}, part {:?}!",
     config.day, config.part
@@ -89,17 +97,56 @@ fn main() -> Result<()> {
     .len(banks.len())
     .fill_val(0)
     .build()?;
-  // Finds the largest joltage possible for each bank.
-  let find_largest = proque
-    .kernel_builder("find_largest2")
-    .global_work_size(batteries.len())
-    .local_work_size(bank_size)
-    .arg(&batteries)
-    .arg(&joltages)
-    .build()?;
 
-  unsafe {
-    find_largest.enq()?;
+  if config.challenge_args.orig && config.part == Part::One {
+    // Finds the largest 2-digit joltage possible for each bank.
+    let find_largest = proque
+      .kernel_builder("find_largest2")
+      .global_work_size(batteries.len())
+      .local_work_size(bank_size)
+      .arg(&batteries)
+      .arg(&joltages)
+      .build()?;
+
+    unsafe {
+      find_largest.enq()?;
+    }
+  } else {
+    // General solution for n-digit joltage.
+    let ndigits = match config.part {
+      Part::One => 2,
+      Part::Two => 12,
+    };
+    let digit_maxn = proque
+      .buffer_builder::<u64>()
+      .len(ndigits * batteries.len())
+      .fill_val(0)
+      .build()?;
+
+    let find_maxn = proque
+      .kernel_builder("find_maxn")
+      .global_work_size((batteries.len(), ndigits))
+      .local_work_size((bank_size, 1))
+      .arg(&batteries)
+      .arg(&digit_maxn)
+      .build()?;
+    let get_joltage = proque
+      .kernel_builder("get_joltage")
+      .global_work_size(
+        (banks.len() as f64 / config.group_size as f64).ceil() as usize * config.group_size,
+      )
+      .local_work_size(config.group_size)
+      .arg(&digit_maxn)
+      .arg(banks.len())
+      .arg(bank_size)
+      .arg(ndigits)
+      .arg(&joltages)
+      .build()?;
+
+    unsafe {
+      find_maxn.enq()?;
+      get_joltage.enq()?;
+    }
   }
 
   debug!("Largest joltages per bank: {:?}", buf2vec(&joltages)?);

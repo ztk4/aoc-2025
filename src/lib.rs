@@ -9,7 +9,7 @@
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Result, eyre};
 use futures::future::FutureExt; // How do you live without Future::then/map?
-use ocl::{Buffer, OclPrm};
+use ocl::{Buffer, Image, OclPrm};
 use smol::{LocalExecutor, channel, future};
 
 use std::any::type_name;
@@ -372,6 +372,14 @@ impl<T: Default> CellApplyExt<T> for std::cell::Cell<T> {
 pub fn buf2vec<T: OclPrm>(buf: &Buffer<T>) -> Result<Vec<T>> {
   let mut vec = vec![T::default(); buf.len()];
   buf.read(&mut vec).enq()?;
+  Ok(vec)
+}
+
+/// Simple conversion of image to vector.
+/// NOTE: Performs a memory transfer from the GPU -> requires buf have a default queue.
+pub fn img2vec<T: OclPrm>(img: &Image<T>) -> Result<Vec<T>> {
+  let mut vec = vec![T::default(); img.element_count()];
+  img.read(&mut vec).enq()?;
   Ok(vec)
 }
 

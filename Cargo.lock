@@ -612,6 +612,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "ilog"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3db32a8bfd5dc0571855c6e514ba88ed8c9a03f622c0714d2e870d7327a6436"
+
+[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -670,8 +676,10 @@ dependencies = [
  "color-eyre",
  "env_logger",
  "futures 0.3.31",
+ "ilog",
  "itertools",
  "log",
+ "num-traits 0.2.19",
  "ocl",
  "smol",
 ]

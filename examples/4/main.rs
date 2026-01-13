@@ -4,8 +4,8 @@ use color_eyre::eyre::{Result, eyre};
 use ilog::IntLog;
 use libaoc::*;
 use log::*;
-use num_traits::Num;
-use ocl::{enums::*, *};
+use num_traits::{FromPrimitive, Num};
+use ocl::{core::ClDeviceIdPtr, enums::*, flags::*, *};
 use std::{fs, ops};
 
 trait IntLogExt {
@@ -21,6 +21,48 @@ impl<T: IntLog + Num + ops::Shl<usize, Output = T>> IntLogExt for T {
       Self::one() << self.log2()
     }
   }
+}
+
+/// Allows queue creation via clCreateCommandQueueWithProperties.
+/// This method allows for additional property values compared to clCreateCommandQueue.
+/// TODO: Make this more general (to support other queue properties).
+fn create_command_queue_with_properties(
+  context: &Context,
+  device: Device,
+  cq_properties: Option<CommandQueueProperties>,
+) -> Result<core::CommandQueue> {
+  // NOTE: This is essentially the impl of Queue::new, with the nested calls to
+  // core::create_command_queue and private utilities inlined -> calling the correct ffi method.
+  core::verify_context(context)?;
+  // This list of cl_queue_properties is a NULL-terminated dictionary of pairs.
+  // Every even index is a property constant, and every odd index is its value.
+  let props = [
+    // QUEUE_PROPERTIES
+    ffi::CL_QUEUE_PROPERTIES as ffi::cl_queue_properties,
+    cq_properties.map_or(0, |p| p.bits()) as ffi::cl_queue_properties,
+    // NULL TERMINATOR
+    0 as ffi::cl_queue_properties,
+  ];
+  debug!("{:?}", props);
+
+  let mut err: ffi::cl_int = 0;
+  let queue = unsafe {
+    ffi::clCreateCommandQueueWithProperties(
+      context.as_ptr(),
+      device.as_ptr(),
+      props.as_ptr(),
+      &mut err,
+    )
+  };
+
+  if core::Status::CL_SUCCESS as i32 != err {
+    return Err(eyre!(
+      "clCreateCommandQueueWithProperties failed with {}",
+      core::Status::from_i32(err).map_or(format!("<invalid code {err}>"), |s| format!("{:?}", s))
+    ));
+  }
+
+  Ok(unsafe { core::CommandQueue::from_raw_create_ptr(queue) })
 }
 
 trait SpatialDimsExt {
@@ -190,6 +232,16 @@ fn main() -> Result<()> {
     .src(fs::read_to_string(config.local_dir.join("printroom.cl"))?)
     .dims(1)
     .build()?;
+  // We're using on-device enqueue, so we need to create a device-side queue for that.
+  let _device_queue = create_command_queue_with_properties(
+    &proque.context(),
+    proque.device(),
+    Some(
+      CommandQueueProperties::ON_DEVICE_DEFAULT  // Will be returned by get_default_queue()
+        | CommandQueueProperties::ON_DEVICE      // Reqd for on-device queues
+        | CommandQueueProperties::OUT_OF_ORDER_EXEC_MODE_ENABLE, // Reqd for on-device queues
+    ),
+  )?;
 
   // Modeling the map as a 2D image.
   let map = Image::<i8>::builder()

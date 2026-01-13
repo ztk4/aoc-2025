@@ -12,5 +12,5 @@ ilog = "1.0.2"
 itertools = "0.14.0"
 log = "0.4.29"
 num-traits = "0.2.19"
-ocl = "0.19.7"
+ocl = { version = "0.19.7", features = ["opencl_version_1_1", "opencl_version_1_2", "opencl_version_2_0", "opencl_version_2_1"] }
 smol = "2.0.2"

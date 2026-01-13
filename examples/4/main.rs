@@ -40,6 +40,9 @@ fn create_command_queue_with_properties(
     // QUEUE_PROPERTIES
     ffi::CL_QUEUE_PROPERTIES as ffi::cl_queue_properties,
     cq_properties.map_or(0, |p| p.bits()) as ffi::cl_queue_properties,
+    // QUEUE_SIZE
+    ffi::CL_QUEUE_SIZE as ffi::cl_queue_properties,
+    1000 as ffi::cl_queue_properties,
     // NULL TERMINATOR
     0 as ffi::cl_queue_properties,
   ];
@@ -233,7 +236,7 @@ fn main() -> Result<()> {
     .dims(1)
     .build()?;
   // We're using on-device enqueue, so we need to create a device-side queue for that.
-  let _device_queue = create_command_queue_with_properties(
+  let device_queue = create_command_queue_with_properties(
     &proque.context(),
     proque.device(),
     Some(
@@ -282,6 +285,7 @@ fn main() -> Result<()> {
     .kernel_builder("find_all_accessible")
     .global_work_size(1)
     .local_work_size(1)
+    .arg(device_queue.as_ptr() as u64)
     .arg(&map)
     .arg(i2_dims)
     .arg(4)

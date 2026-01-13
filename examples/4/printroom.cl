@@ -87,39 +87,40 @@ inline size_t round_to_multiple(size_t size, size_t multiple) {
 global int it = 0;
 
 __attribute__((reqd_work_group_size(1, 1, 1))) kernel void find_all_accessible(
-    global char* map, int2 dims, int limit, global char* buffer) {
+    ulong queue, global char* map, int2 dims, int limit, global char* buffer) {
   // printf("find_all_accessible\n");
   int status;
+  printf("%ld\n", (queue_t)queue);
 
   // Reset flag for this iteration.
   atomic_store_explicit(&modified, false, memory_order_relaxed);
 
   // Hard-coding in a preferred group size of 32x32...
   // I _could_ parameterize this from the host, but...
-  queue_t queue = get_default_queue();
+  // queue_t queue = get_default_queue();
   ndrange_t range = ndrange_2D(
       (size_t[]){round_to_multiple(dims.x, 32), round_to_multiple(dims.y, 32)},
       (size_t[]){32, 32});
 
   // Schedule a find pass over map + a tracking event.
   clk_event_t find_event;
-  status = enqueue_kernel(queue, CLK_ENQUEUE_FLAGS_WAIT_KERNEL, range, 0, NULL,
-                          &find_event, ^{
+  status = enqueue_kernel((queue_t)queue, CLK_ENQUEUE_FLAGS_WAIT_KERNEL, range,
+                          0, NULL, &find_event, ^{
                             find_accessible(map, dims, limit, buffer);
                           });
   printf("Enqueue find_accessible: %d\n", status);
 
   // Schedule a small block to optionally iterate again afterwards.
   status = enqueue_kernel(
-      queue, CLK_ENQUEUE_FLAGS_WAIT_KERNEL, ndrange_1D(1), 1, &find_event, NULL,
-      ^{
+      (queue_t)queue, CLK_ENQUEUE_FLAGS_WAIT_KERNEL, ndrange_1D(1), 1,
+      &find_event, NULL, ^{
         // printf("\nChecking modified atomic.\n");
         if (atomic_load_explicit(&modified, memory_order_relaxed)) {
           printf("Scheduling iteration %d\n", ++it);
           //  NOTE: We swap buffer and map for the next iteration.
-          enqueue_kernel(get_default_queue(), CLK_ENQUEUE_FLAGS_WAIT_KERNEL,
+          enqueue_kernel((queue_t)queue, CLK_ENQUEUE_FLAGS_WAIT_KERNEL,
                          ndrange_1D(1), ^{
-                           find_all_accessible(buffer, dims, limit, map);
+                           find_all_accessible(queue, buffer, dims, limit, map);
                          });
         } else {
           printf("Not modified; exit.\n");

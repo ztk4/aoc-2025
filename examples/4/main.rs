@@ -5,7 +5,7 @@ use ilog::IntLog;
 use libaoc::*;
 use log::*;
 use num_traits::{FromPrimitive, Num};
-use ocl::{core::ClDeviceIdPtr, enums::*, flags::*, *};
+use ocl::{core::ClDeviceIdPtr, enums::*, flags::*, prm::*, *};
 use std::{fs, ops};
 
 trait IntLogExt {
@@ -243,13 +243,12 @@ fn main() -> Result<()> {
     ),
   )?;
 
+  let i2_dims = Int2::new(input[0].len() as i32, input.len() as i32);
+  let dims: SpatialDims = i2_dims.first_chunk::<2>().unwrap().into();
   // Modeling the map as a 2D image.
-  let map = Image::<i8>::builder()
-    .queue(proque.queue().clone())
-    .image_type(MemObjectType::Image2d)
-    .dims((input[0].len(), input.len())) // assume rectangular
-    .channel_order(ImageChannelOrder::Luminance) // single channel
-    .channel_data_type(ImageChannelDataType::SignedInt8)
+  let map = proque
+    .buffer_builder::<i8>()
+    .len(dims.to_len())
     .copy_host_slice(
       &input
         .into_iter()
@@ -262,21 +261,20 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>(),
     )
     .build()?;
-  let buffer = Image::<i8>::builder()
-    .queue(proque.queue().clone())
-    .image_type(MemObjectType::Image2d)
-    .dims(map.dims())
-    .channel_order(ImageChannelOrder::Luminance)
-    .channel_data_type(ImageChannelDataType::SignedInt8)
+  let buffer = proque
+    .buffer_builder::<i8>()
+    .len(dims.to_len())
+    .fill_val(0)
     .build()?;
 
   // Hardcoding a reasonably efficient working size for now.
   let lws = SpatialDims::Two(32, 32);
   let find_accessible = proque
     .kernel_builder("find_accessible")
-    .global_work_size(map.dims().to_padded_dims(lws)?)
+    .global_work_size(dims.to_padded_dims(lws)?)
     .local_work_size(lws)
     .arg(&map)
+    .arg(i2_dims)
     .arg(4)
     .arg(&buffer)
     .build()?;
@@ -285,9 +283,8 @@ fn main() -> Result<()> {
     .global_work_size(1)
     .local_work_size(1)
     .arg(&map)
-    .arg(&map)
+    .arg(i2_dims)
     .arg(4)
-    .arg(&buffer)
     .arg(&buffer)
     .build()?;
 
@@ -297,6 +294,7 @@ fn main() -> Result<()> {
     .kernel_builder("count_accessible")
     .local_work_size(lws)
     .arg(&map)
+    .arg(i2_dims)
     .arg(&count_map)
     .arg_named("scratch", None::<&Buffer<i64>>) // We don't know what size yet
     .build()?;
@@ -304,13 +302,13 @@ fn main() -> Result<()> {
     .kernel_builder("count_accessible")
     .local_work_size(lws)
     .arg(&buffer)
+    .arg(i2_dims)
     .arg(&count_buf)
     .arg_named("scratch", None::<&Buffer<i64>>) // We don't know what size yet
     .build()?;
 
   // Both images are identically sized + kernels will run sequentially (scartch can be shared).
-  let gws =
-    get_mem_bound_reduce_gws_hint(&proque.device(), &count_accessible_buf, lws, buffer.dims())?;
+  let gws = get_mem_bound_reduce_gws_hint(&proque.device(), &count_accessible_buf, lws, dims)?;
   count_accessible_map.set_default_global_work_size(gws);
   count_accessible_buf.set_default_global_work_size(gws);
   let scratch = proque
@@ -335,8 +333,8 @@ fn main() -> Result<()> {
     }
   }
 
-  debug!("Map: {:?}", img2vec(&map)?);
-  debug!("Buffer: {:?}", img2vec(&buffer)?);
+  debug!("Map: {:?}", buf2vec(&map)?);
+  debug!("Buffer: {:?}", buf2vec(&buffer)?);
   debug!("Scratch: {:?}", buf2vec(&scratch)?);
 
   // In part two, we don't know which image had the final result,

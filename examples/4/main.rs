@@ -1,5 +1,6 @@
 //! AoC Day 4
 #![feature(result_flattening, macro_metavar_expr)]
+use clap::{Args, arg};
 use color_eyre::eyre::{Result, eyre};
 use ilog::IntLog;
 use libaoc::*;
@@ -40,13 +41,10 @@ fn create_command_queue_with_properties(
     // QUEUE_PROPERTIES
     ffi::CL_QUEUE_PROPERTIES as ffi::cl_queue_properties,
     cq_properties.map_or(0, |p| p.bits()) as ffi::cl_queue_properties,
-    // QUEUE_SIZE
-    ffi::CL_QUEUE_SIZE as ffi::cl_queue_properties,
-    1000 as ffi::cl_queue_properties,
     // NULL TERMINATOR
     0 as ffi::cl_queue_properties,
   ];
-  debug!("{:?}", props);
+  debug!("Queue props: {:?}", props);
 
   let mut err: ffi::cl_int = 0;
   let queue = unsafe {
@@ -183,46 +181,20 @@ fn get_mem_bound_reduce_gws_hint(
   Ok(SpatialDims::Three(x, y, z).reduce())
 }
 
-/*
-fn sum(buffer: &Buffer<i64>, proque: &ProQue, lws: usize) -> Result<i64> {
-  let mut partial_sums = buffer.clone();
-  let mut reduce_kerns: Vec<Kernel> = vec![];
-  while partial_sums.len() > 1 {
-    let gws = util::padded_len(partial_sums.len(), lws);
-    let new_partials = proque
-      .buffer_builder::<i64>()
-      .len(gws / lws)
-      .fill_val(0)
-      .build()?;
-    reduce_kerns.push(
-      proque
-        .kernel_builder("sum")
-        .global_work_size(gws)
-        .local_work_size(lws)
-        .arg(&partial_sums)
-        .arg(partial_sums.len())
-        .arg(&new_partials)
-        .build()?,
-    );
-
-    partial_sums = new_partials;
-  }
-
-  unsafe {
-    for kern in reduce_kerns {
-      kern.enq()?;
-    }
-  }
-
-  Ok(buf2vec(&partial_sums)?.into_iter().exactly_one()?)
+#[derive(Args)]
+struct Options {
+  /// The maximum number of times a kenel enqueued by the host may enqueue kernels on device.
+  /// NOTE: For my RTX 3080, on-device enqueue is not officially supported, but seems to tolerate
+  /// up to ~24 enqueues.
+  #[arg(default_value_t = 20)]
+  max_ondevice_enqueues: i32,
 }
-*/
 
 fn main() -> Result<()> {
   env_logger::init();
   color_eyre::install()?;
 
-  let config = create_config!()?;
+  let config = create_config!(challenge_args: Options)?;
   info!(
     "Advent of Code day #{}, part {:?}!",
     config.day, config.part
@@ -236,7 +208,7 @@ fn main() -> Result<()> {
     .dims(1)
     .build()?;
   // We're using on-device enqueue, so we need to create a device-side queue for that.
-  let device_queue = create_command_queue_with_properties(
+  let _device_queue = create_command_queue_with_properties(
     &proque.context(),
     proque.device(),
     Some(
@@ -248,7 +220,7 @@ fn main() -> Result<()> {
 
   let i2_dims = Int2::new(input[0].len() as i32, input.len() as i32);
   let dims: SpatialDims = i2_dims.first_chunk::<2>().unwrap().into();
-  // Modeling the map as a 2D image.
+  // Modeling the map as a buffer.
   let map = proque
     .buffer_builder::<i8>()
     .len(dims.to_len())
@@ -269,6 +241,7 @@ fn main() -> Result<()> {
     .len(dims.to_len())
     .fill_val(0)
     .build()?;
+  let finished = proque.buffer_builder::<i32>().fill_val(0).build()?;
 
   // Hardcoding a reasonably efficient working size for now.
   let lws = SpatialDims::Two(32, 32);
@@ -285,11 +258,17 @@ fn main() -> Result<()> {
     .kernel_builder("find_all_accessible")
     .global_work_size(1)
     .local_work_size(1)
-    .arg(device_queue.as_ptr() as u64)
     .arg(&map)
     .arg(i2_dims)
     .arg(4)
     .arg(&buffer)
+    // Each pass of this kernel schedules 2 kernels on-device.
+    // But we also want this to be an odd number s.t. the unfinished result is always in map.
+    .arg(match config.challenge_args.max_ondevice_enqueues / 2 {
+      n if n % 2 == 0 => n - 1,
+      n => n,
+    })
+    .arg(&finished)
     .build()?;
 
   let count_map = proque.buffer_builder::<i64>().fill_val(0).build()?;
@@ -311,7 +290,7 @@ fn main() -> Result<()> {
     .arg_named("scratch", None::<&Buffer<i64>>) // We don't know what size yet
     .build()?;
 
-  // Both images are identically sized + kernels will run sequentially (scartch can be shared).
+  // Both buffers are identically sized + kernels will run sequentially (scratch can be shared).
   let gws = get_mem_bound_reduce_gws_hint(&proque.device(), &count_accessible_buf, lws, dims)?;
   count_accessible_map.set_default_global_work_size(gws);
   count_accessible_buf.set_default_global_work_size(gws);
@@ -323,16 +302,41 @@ fn main() -> Result<()> {
   count_accessible_map.set_arg("scratch", Some(&scratch))?;
   count_accessible_buf.set_arg("scratch", Some(&scratch))?;
 
-  unsafe {
-    match config.part {
-      Part::One => {
-        find_accessible.enq()?;
-        count_accessible_buf.enq()?;
+  let count_accessible2_map = proque
+    .kernel_builder("count_accessible2")
+    .global_work_size(scratch.len())
+    .local_work_size(scratch.len())
+    .arg(&scratch)
+    .arg(&count_map)
+    .build()?;
+  let count_accessible2_buf = proque
+    .kernel_builder("count_accessible2")
+    .global_work_size(scratch.len())
+    .local_work_size(scratch.len())
+    .arg(&scratch)
+    .arg(&count_buf)
+    .build()?;
+
+  match config.part {
+    Part::One => unsafe {
+      find_accessible.enq()?;
+      count_accessible_buf.enq()?;
+      count_accessible2_buf.enq()?;
+    },
+    Part::Two => {
+      loop {
+        unsafe {
+          find_all_accessible.enq()?;
+        }
+        if buf2vec(&finished)?.into_iter().exactly_one()? > 0 {
+          break;
+        }
       }
-      Part::Two => {
-        find_all_accessible.enq()?;
+      unsafe {
         count_accessible_map.enq()?;
+        count_accessible2_map.enq()?;
         count_accessible_buf.enq()?;
+        count_accessible2_buf.enq()?;
       }
     }
   }

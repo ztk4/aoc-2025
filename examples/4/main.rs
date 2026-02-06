@@ -2,31 +2,17 @@
 #![feature(result_flattening, macro_metavar_expr)]
 use clap::{Args, arg};
 use color_eyre::eyre::{Result, eyre};
-use ilog::IntLog;
 use libaoc::*;
 use log::*;
-use num_traits::{FromPrimitive, Num};
-use ocl::{core::ClDeviceIdPtr, enums::*, flags::*, prm::*, *};
-use std::{fs, ops};
-
-trait IntLogExt {
-  fn prev_power_of_two(self) -> Self;
-}
-
-impl<T: IntLog + Num + ops::Shl<usize, Output = T>> IntLogExt for T {
-  // NOTE: Panics if self < 0.
-  fn prev_power_of_two(self) -> Self {
-    if self == Self::zero() {
-      self
-    } else {
-      Self::one() << self.log2()
-    }
-  }
-}
+use num_traits::FromPrimitive;
+use ocl::{core::ClDeviceIdPtr, flags::*, prm::*, *};
+use std::fs;
 
 /// Allows queue creation via clCreateCommandQueueWithProperties.
 /// This method allows for additional property values compared to clCreateCommandQueue.
 /// TODO: Make this more general (to support other queue properties).
+/// NOTE: I probably will not expand this since device-side queues are not officially supported on
+///       my hardware.
 fn create_command_queue_with_properties(
   context: &Context,
   device: Device,
@@ -64,121 +50,6 @@ fn create_command_queue_with_properties(
   }
 
   Ok(unsafe { core::CommandQueue::from_raw_create_ptr(queue) })
-}
-
-trait SpatialDimsExt {
-  fn to_padded_dims(&self, incr: impl Into<Self>) -> Result<Self>
-  where
-    Self: Sized;
-
-  fn reduce(&self) -> Self;
-}
-
-impl SpatialDimsExt for SpatialDims {
-  fn to_padded_dims(&self, incr: impl Into<Self>) -> Result<Self> {
-    let i = incr.into();
-    Ok(match (self.reduce(), i.reduce()) {
-      (Self::One(x), Self::One(ix)) => util::padded_len(x, ix).into(),
-      (Self::Two(x, y), Self::Two(ix, iy)) => {
-        (util::padded_len(x, ix), util::padded_len(y, iy)).into()
-      }
-      (Self::Three(x, y, z), Self::Three(ix, iy, iz)) => (
-        util::padded_len(x, ix),
-        util::padded_len(y, iy),
-        util::padded_len(z, iz),
-      )
-        .into(),
-      _ => {
-        return Err(eyre!(
-          "Can't pad dims of cardinality {} to target of cardinality {}: {self:?} -> {i:?}",
-          self.dim_count(),
-          i.dim_count()
-        ));
-      }
-    })
-  }
-
-  fn reduce(&self) -> SpatialDims {
-    match *self {
-      Self::Two(x, 1) | Self::Three(x, 1, 1) => Self::One(x),
-      Self::Three(x, y, 1) => Self::Two(x, y),
-      s => s,
-    }
-  }
-}
-
-// Returns an heuristically optimal number of groups to use when scheduling a memory-bound kernel.
-// The logic is that we would want a small multiple of #CU s.t. latency hiding "kicks in".
-// Since my kernels (for AoC) tend to be overwhelmingly memory bound, I'm opting for 7x.
-fn get_mem_bound_num_groups_hint(device: &Device) -> Result<usize> {
-  let DeviceInfoResult::MaxComputeUnits(cu) = device.info(DeviceInfo::MaxComputeUnits)? else {
-    panic!("Wrong device info type!");
-  };
-
-  Ok(cu as usize * 7)
-}
-
-// Similar to the above, but tuned for a 2-pass reduce operation.
-// In this case, we want the result to be a multiple of the "warp size", and less than the max group size.
-// NOTE: Usually the warp size will be a power of 2, and there can be advantages to picking another
-// power of 2 as opposed to just any multiple.
-fn get_mem_bound_reduce_num_groups_hint(device: &Device, kernel: &Kernel) -> Result<usize> {
-  let DeviceInfoResult::MaxWorkGroupSize(max_lws) = device.info(DeviceInfo::MaxWorkGroupSize)?
-  else {
-    panic!("Wrong device info type!");
-  };
-  let KernelWorkGroupInfoResult::PreferredWorkGroupSizeMultiple(mult) =
-    kernel.wg_info(*device, KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple)?
-  else {
-    panic!("Wrong kernel work group info type!");
-  };
-
-  // The result will always be a multiple of mult (assuming max_lws is...),
-  // and if mult is a power of two, the result will also be a power of two.. assuming max_lws is.
-  let hint = get_mem_bound_num_groups_hint(device)?;
-  Ok(
-    if mult.is_power_of_two() {
-      hint.next_power_of_two()
-    } else {
-      hint.next_multiple_of(mult)
-    }
-    .clamp(mult, max_lws),
-  )
-}
-
-// Computes the global work size to use in a 2-pass reduce operation.
-// Returns a work size that results in scheduling a heuristically optimal number of groups.
-// NOTE: Assumes a memory-bound typical grid-stride reduce, matching the above heuristics.
-//       This function both splits ngroups across dimensions + converts to a gws.
-fn get_mem_bound_reduce_gws_hint(
-  device: &Device,
-  kernel: &Kernel,
-  lws: impl Into<SpatialDims>,
-  reduce_size: impl Into<SpatialDims>,
-) -> Result<SpatialDims> {
-  // Returns a linear group hint less than budget, but always a power of 2.
-  fn get_linear_ngroups_hint(lws: usize, size: usize, budget: usize) -> usize {
-    (size / lws).prev_power_of_two().clamp(1, budget)
-  }
-
-  // Breaks budget across dimensions s.t. the product equals budget.
-  // NOTE: For simplicity, we coerce budget to be a power of two here...
-  let budget = get_mem_bound_reduce_num_groups_hint(device, kernel)?.prev_power_of_two();
-  let Some((x, y, z)) = lws
-    .into()
-    .to_lens()?
-    .into_iter()
-    .zip(reduce_size.into().to_lens()?.into_iter())
-    .scan(budget, |budget, (ld, sd)| {
-      let hint = get_linear_ngroups_hint(ld, sd, *budget);
-      *budget /= hint;
-      Some(hint * ld) // The hinted gws = ngroups * lws
-    })
-    .collect_tuple()
-  else {
-    panic!("Expected exactly 3 usize when iterating SpatialDims")
-  };
-  Ok(SpatialDims::Three(x, y, z).reduce())
 }
 
 #[derive(Args)]

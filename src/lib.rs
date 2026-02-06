@@ -9,10 +9,14 @@
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Result, eyre};
 use futures::future::FutureExt; // How do you live without Future::then/map?
-use ocl::{Buffer, Image, OclPrm};
+use ilog::IntLog;
+use num_traits::PrimInt;
+use ocl::enums::{DeviceInfo, DeviceInfoResult, KernelWorkGroupInfo, KernelWorkGroupInfoResult};
+use ocl::{Buffer, Device, Image, Kernel, OclPrm, SpatialDims};
 use smol::{LocalExecutor, channel, future};
 
 use std::any::type_name;
+use std::cmp::Ordering;
 use std::ops::{ControlFlow, FromResidual, Residual, Try};
 use std::slice::Iter;
 use std::str::{FromStr, Split, SplitWhitespace, pattern::Pattern};
@@ -365,7 +369,58 @@ impl<T: Default> CellApplyExt<T> for std::cell::Cell<T> {
   }
 }
 
+/// Generic rust "extensions".
+pub trait IntLogExt {
+  fn prev_power_of_two(self) -> Self;
+}
+
+impl<T: IntLog + PrimInt> IntLogExt for T {
+  // NOTE: Panics if self < 0.
+  fn prev_power_of_two(self) -> Self {
+    match self.cmp(&Self::zero()) {
+      Ordering::Greater => Self::one() << self.log2(),
+      Ordering::Equal => self,
+      Ordering::Less => panic!("prev_power_of_two not implemented for negative numbers"),
+    }
+  }
+}
+
 /// Helpers for working with ocl.
+
+pub trait SpatialDimsExt {
+  /// Pads dimensions into multiples of the components of `incr`.
+  /// E.g. (13, 9, 14).to_padded_dims((5, 4, 8)) -> (15, 12, 16).
+  fn to_padded_dims(&self, incr: impl Into<Self>) -> Result<Self>
+  where
+    Self: Sized;
+
+  /// Reduces a spatial dims with trailing 1 dimensions.
+  /// E.g. (3, 10, 1) -> (3, 10) BUT (3, 1, 10) -> (3, 1, 10).
+  fn reduce(&self) -> Self;
+}
+
+impl SpatialDimsExt for SpatialDims {
+  fn to_padded_dims(&self, incr: impl Into<Self>) -> Result<Self> {
+    let [x, y, z] = self.to_lens()?;
+    let [ix, iy, iz] = incr.into().to_lens()?;
+    Ok(
+      Self::Three(
+        x.next_multiple_of(ix),
+        y.next_multiple_of(iy),
+        z.next_multiple_of(iz),
+      )
+      .reduce(),
+    )
+  }
+
+  fn reduce(&self) -> SpatialDims {
+    match *self {
+      Self::Two(x, 1) | Self::Three(x, 1, 1) => Self::One(x),
+      Self::Three(x, y, 1) => Self::Two(x, y),
+      s => s,
+    }
+  }
+}
 
 /// Simple conversion of buffer to vector.
 /// NOTE: Performs a memory transfer from the GPU -> requires buf have a default queue.
@@ -381,6 +436,80 @@ pub fn img2vec<T: OclPrm>(img: &Image<T>) -> Result<Vec<T>> {
   let mut vec = vec![T::default(); img.element_count()];
   img.read(&mut vec).enq()?;
   Ok(vec)
+}
+
+/// Returns an heuristically optimal number of groups to use when scheduling a memory-bound kernel.
+/// The logic is that we would want a small multiple of #CU s.t. latency hiding "kicks in".
+/// Since my kernels (for AoC) tend to be overwhelmingly memory bound, I'm opting for 7x.
+pub fn get_mem_bound_num_groups_hint(device: &Device) -> Result<usize> {
+  let DeviceInfoResult::MaxComputeUnits(cu) = device.info(DeviceInfo::MaxComputeUnits)? else {
+    panic!("Wrong device info type!");
+  };
+
+  Ok(cu as usize * 7)
+}
+
+/// Similar to the above, but tuned for a 2-pass reduce operation.
+/// In this case, we want the result to be a multiple of the "warp size", and less than the max group size.
+/// NOTE: Usually the warp size will be a power of 2, and there can be advantages to picking another
+/// power of 2 as opposed to just any multiple.
+pub fn get_mem_bound_reduce_num_groups_hint(device: &Device, kernel: &Kernel) -> Result<usize> {
+  let DeviceInfoResult::MaxWorkGroupSize(max_lws) = device.info(DeviceInfo::MaxWorkGroupSize)?
+  else {
+    panic!("Wrong device info type!");
+  };
+  let KernelWorkGroupInfoResult::PreferredWorkGroupSizeMultiple(mult) =
+    kernel.wg_info(*device, KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple)?
+  else {
+    panic!("Wrong kernel work group info type!");
+  };
+
+  // The result will always be a multiple of mult (assuming max_lws is...),
+  // and if mult is a power of two, the result will also be a power of two.. assuming max_lws is.
+  let hint = get_mem_bound_num_groups_hint(device)?;
+  Ok(
+    if mult.is_power_of_two() {
+      hint.next_power_of_two()
+    } else {
+      hint.next_multiple_of(mult)
+    }
+    .clamp(mult, max_lws),
+  )
+}
+
+/// Computes the global work size to use in a 2-pass reduce operation.
+/// Returns a work size that results in scheduling a heuristically optimal number of groups.
+/// NOTE: Assumes a memory-bound typical grid-stride reduce, matching the above heuristics.
+///       This function both splits ngroups across dimensions + converts to a gws.
+pub fn get_mem_bound_reduce_gws_hint(
+  device: &Device,
+  kernel: &Kernel,
+  lws: impl Into<SpatialDims>,
+  reduce_size: impl Into<SpatialDims>,
+) -> Result<SpatialDims> {
+  // Returns a linear group hint less than budget, but always a power of 2.
+  fn get_linear_ngroups_hint(lws: usize, size: usize, budget: usize) -> usize {
+    (size / lws).prev_power_of_two().clamp(1, budget)
+  }
+
+  // Breaks budget across dimensions s.t. the product equals budget.
+  // NOTE: For simplicity, we coerce budget to be a power of two here...
+  let budget = get_mem_bound_reduce_num_groups_hint(device, kernel)?.prev_power_of_two();
+  let Some((x, y, z)) = lws
+    .into()
+    .to_lens()?
+    .into_iter()
+    .zip(reduce_size.into().to_lens()?.into_iter())
+    .scan(budget, |budget, (ld, sd)| {
+      let hint = get_linear_ngroups_hint(ld, sd, *budget);
+      *budget /= hint;
+      Some(hint * ld) // The hinted gws = ngroups * lws
+    })
+    .collect_tuple()
+  else {
+    panic!("Expected exactly 3 usize when iterating SpatialDims::to_lens")
+  };
+  Ok(SpatialDims::Three(x, y, z).reduce())
 }
 
 /// Some minimal unit testing.
@@ -569,5 +698,140 @@ mod tests {
       .is_err()
     );
     Ok(())
+  }
+
+  #[test]
+  fn prev_power_of_two_generic() {
+    assert_eq!(3u8.prev_power_of_two(), 2u8);
+    assert_eq!(125i32.prev_power_of_two(), 64i32);
+    assert_eq!(255u8.prev_power_of_two(), 128u8);
+    assert_eq!(67231u64.prev_power_of_two(), 65536u64);
+  }
+
+  #[test]
+  fn prev_power_of_two_powers_of_two() {
+    assert_eq!(1i16.prev_power_of_two(), 1i16);
+    assert_eq!(256u16.prev_power_of_two(), 256u16);
+    assert_eq!(1024i32.prev_power_of_two(), 1024i32);
+    assert_eq!(1048576i64.prev_power_of_two(), 1048576i64);
+  }
+
+  #[test]
+  fn prev_power_of_two_zero() {
+    assert_eq!(0.prev_power_of_two(), 0);
+  }
+
+  #[test]
+  #[should_panic = "not implemented"]
+  fn prev_power_of_two_negative() {
+    println!("{}", (-10).prev_power_of_two());
+  }
+
+  #[test]
+  fn spatial_dims_reduce_reduces() {
+    assert_eq!(
+      SpatialDims::Three(10, 25, 1).reduce(),
+      SpatialDims::Two(10, 25)
+    );
+    assert_eq!(SpatialDims::Three(42, 1, 1).reduce(), SpatialDims::One(42));
+    assert_eq!(SpatialDims::Two(17, 1).reduce(), SpatialDims::One(17));
+  }
+
+  #[test]
+  fn spatial_dims_reduce_identities() {
+    assert_eq!(
+      SpatialDims::Three(5, 10, 15).reduce(),
+      SpatialDims::Three(5, 10, 15)
+    );
+    assert_eq!(SpatialDims::Two(42, 17).reduce(), SpatialDims::Two(42, 17));
+    assert_eq!(SpatialDims::One(1).reduce(), SpatialDims::One(1));
+  }
+
+  #[test]
+  fn spatial_dims_only_folds_from_the_right() {
+    assert_eq!(
+      SpatialDims::Three(1, 1, 5).reduce(),
+      SpatialDims::Three(1, 1, 5)
+    );
+    assert_eq!(
+      SpatialDims::Three(1, 4, 5).reduce(),
+      SpatialDims::Three(1, 4, 5)
+    );
+    assert_eq!(
+      SpatialDims::Three(3, 1, 5).reduce(),
+      SpatialDims::Three(3, 1, 5)
+    );
+    assert_eq!(SpatialDims::Two(1, 14).reduce(), SpatialDims::Two(1, 14));
+  }
+
+  #[test]
+  fn spatial_dims_to_padded_dims_generic() -> Result<()> {
+    assert_eq!(
+      SpatialDims::Three(13, 9, 14).to_padded_dims((5, 4, 8))?,
+      SpatialDims::Three(15, 12, 16)
+    );
+    assert_eq!(
+      SpatialDims::Two(17, 21).to_padded_dims((19, 2))?,
+      SpatialDims::Two(19, 22)
+    );
+    assert_eq!(
+      SpatialDims::One(42).to_padded_dims(256)?,
+      SpatialDims::One(256)
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn spatial_dims_to_padded_dims_multiples() -> Result<()> {
+    assert_eq!(
+      SpatialDims::Three(1, 2, 3).to_padded_dims((3, 3, 3))?,
+      SpatialDims::Three(3, 3, 3)
+    );
+    assert_eq!(
+      SpatialDims::Two(10, 20).to_padded_dims((5, 4))?,
+      SpatialDims::Two(10, 20)
+    );
+    assert_eq!(
+      SpatialDims::One(15).to_padded_dims(15)?,
+      SpatialDims::One(15)
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn spatial_dims_to_padded_dims_ones() -> Result<()> {
+    assert_eq!(
+      SpatialDims::Three(1, 2, 3).to_padded_dims((3, 2, 1))?,
+      SpatialDims::Three(3, 2, 3)
+    );
+    assert_eq!(
+      SpatialDims::Two(13, 21).to_padded_dims((1, 1))?,
+      SpatialDims::Two(13, 21)
+    );
+    assert_eq!(SpatialDims::One(1).to_padded_dims(1)?, SpatialDims::One(1));
+    Ok(())
+  }
+
+  #[test]
+  fn spatial_dims_to_padded_dims_implied_ones() -> Result<()> {
+    assert_eq!(
+      SpatialDims::Three(1, 2, 3).to_padded_dims(5)?,
+      SpatialDims::Three(5, 2, 3)
+    );
+    assert_eq!(
+      SpatialDims::Two(14, 42).to_padded_dims(3)?,
+      SpatialDims::Two(15, 42)
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn spatial_dims_to_padded_dims_unspecified() {
+    assert!(SpatialDims::Unspecified.to_padded_dims(3).is_err());
+    assert!(
+      SpatialDims::Two(10, 23)
+        .to_padded_dims(SpatialDims::Unspecified)
+        .is_err()
+    );
   }
 }

@@ -54,15 +54,15 @@ fn main() -> Result<()> {
     .len(ids.len())
     .copy_host_slice(&ids)
     .build()?;
-  let lo = proque
-    .buffer_builder::<u64>()
+  let ranges = proque
+    .buffer_builder::<prm::Ulong2>()
     .len(ranges.len())
-    .copy_host_slice(&ranges.iter().map(|r| r.lo).collect::<Vec<_>>())
-    .build()?;
-  let hi = proque
-    .buffer_builder::<u64>()
-    .len(ranges.len())
-    .copy_host_slice(&ranges.into_iter().map(|r| r.hi).collect::<Vec<_>>())
+    .copy_host_slice(
+      &ranges
+        .iter()
+        .map(|r| [r.lo, r.hi].into())
+        .collect::<Vec<_>>(),
+    )
     .build()?;
 
   let gs_lws = config.group_size;
@@ -71,9 +71,8 @@ fn main() -> Result<()> {
     .local_work_size(gs_lws)
     .arg(&ids)
     .arg(ids.len() as i32)
-    .arg(&lo)
-    .arg(&hi)
-    .arg(lo.len() as i32)
+    .arg(&ranges)
+    .arg(ranges.len() as i32)
     .arg_named("counts", None::<&Buffer<u64>>) // We don't know the size yet.
     .build()?;
 

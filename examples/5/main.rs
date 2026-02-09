@@ -22,7 +22,10 @@ impl FromStr for Range {
   }
 }
 
-/// Sorts buffer using bitonic sort.
+/// Sorts by (buffer.x, -buffer.y) using bitonic sort.
+/// This choice of sort key is specific to the problem I'm solving.
+/// Specifically, the secondary sort by -y ensures for equivalent endpoints, we process opens
+/// before closures -> avoids double counts of completely interior endpoints.
 /// NB: buffer's length and group_size must be a power of two.
 fn bitonic_sort(buffer: &Buffer<prm::Long2>, proque: &ProQue, group_size: usize) -> Result<()> {
   if !buffer.len().is_power_of_two() {
@@ -57,7 +60,60 @@ fn bitonic_sort(buffer: &Buffer<prm::Long2>, proque: &ProQue, group_size: usize)
 
   for kern in kerns {
     unsafe { kern.enq()? }
-    debug!("buffer: {:?}", buf2vec(buffer)?);
+    debug!("bitonic buffer: {:?}", buf2vec(buffer)?);
+  }
+
+  Ok(())
+}
+
+/// Performs a prefix sum of buffer.y.
+/// Will target a final reduction of size `group_size` or smaller.
+fn prefix_sum(buffer: &Buffer<prm::Long2>, proque: &ProQue, group_size: usize) -> Result<()> {
+  // NOTE: These values _could_ be computed from CL device constants...
+  //       but I'm being lazy and hardcoding good values for my hardware.
+  // Because kernel #1 uses a lot of registers, let's cap at 512 to avoid issues.
+  let lws = std::cmp::min(512, group_size);
+  // Keep the reduce-size for kernel #2 bounded by the max group size.
+  let ngroups = std::cmp::min(1024, group_size);
+  let gws = lws * ngroups;
+
+  if buffer.len() / gws > 64 {
+    return Err(eyre!(
+      "Cannot run partial reduce kernel with more than 64 elements per thread; currently {}",
+      buffer.len() / gws
+    ));
+  }
+
+  let partial_reduce = proque
+    .kernel_builder("cumsum_block_partial_reduce")
+    .global_work_size(gws)
+    .local_work_size(lws)
+    .arg(buffer)
+    .arg(buffer.len() as i32)
+    .build()?;
+  let full_reduce = proque
+    .kernel_builder("cumsum_full_reduce")
+    .global_work_size(ngroups)
+    .local_work_size(ngroups)
+    .arg(buffer)
+    .arg(buffer.len() as i32)
+    .arg((buffer.len().div_ceil(gws) * lws) as i32)
+    .build()?;
+  let propagate = proque
+    .kernel_builder("cumsum_propagate")
+    .global_work_size(gws)
+    .local_work_size(lws)
+    .arg(buffer)
+    .arg(buffer.len() as i32)
+    .build()?;
+
+  unsafe {
+    partial_reduce.enq()?;
+    debug!("prefix_partial: {:?}", buf2vec(buffer)?);
+    full_reduce.enq()?;
+    debug!("prefix_reduce: {:?}", buf2vec(buffer)?);
+    propagate.enq()?;
+    debug!("prefix_propagate: {:?}", buf2vec(buffer)?);
   }
 
   Ok(())
@@ -135,7 +191,7 @@ fn main() -> Result<()> {
       get_counts.set_arg("counts", Some(&counts))?;
 
       let reduce_counts = proque
-        .kernel_builder("reduce_counts")
+        .kernel_builder("sum_reduce")
         .global_work_size(r_lws)
         .local_work_size(r_lws)
         .arg(&counts)
@@ -171,7 +227,55 @@ fn main() -> Result<()> {
         )
         .build()?;
 
+      // Sort intervals by endpoint.
       bitonic_sort(&endpoints, &proque, config.group_size)?;
+      // Prefix sum open/close markers to know where the interior is.
+      prefix_sum(&endpoints, &proque, config.group_size)?;
+
+      let mut partial_reduce = proque
+        .kernel_builder("interior_sum_block_partial_reduce")
+        .local_work_size(config.group_size)
+        .arg(&endpoints)
+        .arg(endpoints.len() as i32)
+        .arg_named("partials", None::<&Buffer<i64>>)
+        .build()?;
+
+      let ngroups = get_mem_bound_reduce_num_groups_hint(&proque.device(), &partial_reduce)?;
+      let gws = get_mem_bound_reduce_gws_hint(
+        &proque.device(),
+        &partial_reduce,
+        config.group_size,
+        endpoints.len(),
+      )?;
+
+      let partials = proque
+        .buffer_builder::<i64>()
+        .len(ngroups)
+        .fill_val(0)
+        .build()?;
+      let result = proque.buffer_builder::<i64>().fill_val(0).build()?;
+
+      partial_reduce.set_default_global_work_size(gws);
+      partial_reduce.set_arg("partials", &partials)?;
+
+      let full_reduce = proque
+        .kernel_builder("sum_reduce")
+        .global_work_size(ngroups)
+        .local_work_size(ngroups)
+        .arg(&partials)
+        .arg(&result)
+        .build()?;
+
+      unsafe {
+        partial_reduce.enq()?;
+        debug!("Partial Sums: {:?}", buf2vec(&partials)?);
+        full_reduce.enq()?;
+      }
+
+      println!(
+        "Num Fresh: {}",
+        buf2vec(&result)?.into_iter().exactly_one()?
+      );
     }
   }
 

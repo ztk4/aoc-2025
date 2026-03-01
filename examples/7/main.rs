@@ -97,17 +97,43 @@ fn main() -> Result<()> {
     .arg(&result)
     .build()?;
 
+  let scratch = proque
+    .buffer_builder::<u64>()
+    .len(manifold.len())
+    .fill_val(0)
+    .build()?;
+  let quantum_propagate = proque
+    .kernel_builder("quantum_propagate")
+    .global_work_size(config.group_size)
+    .local_work_size(config.group_size)
+    .arg(&vlookup)
+    .arg(&manifold)
+    .arg(size)
+    .arg(&result)
+    .arg(&scratch)
+    .build()?;
+
   unsafe {
     build_vlookup.enq()?;
     debug!("VLookup: {:?}", buf2vec(&vlookup)?);
-    propagate.enq()?;
-    debug!("Propagated Manifold: {:?}", buf2vec(&manifold)?);
-    count_partial.enq()?;
-    count_full.enq()?;
+
+    match config.part {
+      Part::One => {
+        propagate.enq()?;
+        debug!("Propagated Manifold: {:?}", buf2vec(&manifold)?);
+        count_partial.enq()?;
+        count_full.enq()?;
+      }
+      Part::Two => quantum_propagate.enq()?,
+    }
   }
 
   println!(
-    "Number of Splits: {}",
+    "Number of {}: {}",
+    match config.part {
+      Part::One => "Splits",
+      Part::Two => "Timelines",
+    },
     buf2vec(&result)?.into_iter().exactly_one()?
   );
 

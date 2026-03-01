@@ -49,19 +49,24 @@ kernel void propagate(global const uint* lookup, uint2 size,
     for (uint x = get_local_id(0); x < size.x; x += get_local_size(0)) {
       uint idx = linearize2d((uint2)(x, y), size);
       switch (scratch[idx]) {
-        case 'S':
-          scratch[lookup[idx]] = '*';
+        case 'S': {
+          uint ref = lookup[idx];
+          if (ref < UINT_MAX) scratch[ref] = '*';
           break;
-        case '*':
+        }
+        case '*': {
           // NOTE: This can race/contend, but always to the same value.
           // Might be performance implications of this though...
-          if (x - 1 >= 0) {
-            scratch[lookup[idx - 1]] = '*';
+          if (x > 0) {
+            uint ref = lookup[idx - 1];
+            if (ref < UINT_MAX) scratch[ref] = '*';
           }
           if (x + 1 < size.x) {
-            scratch[lookup[idx + 1]] = '*';
+            uint ref = lookup[idx + 1];
+            if (ref < UINT_MAX) scratch[ref] = '*';
           }
           break;
+        }
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -72,6 +77,57 @@ kernel void propagate(global const uint* lookup, uint2 size,
        idx += get_local_size(0)) {
     manifold[idx] = scratch[idx];
   }
+}
+
+/// Single-Group Quantum Propagate ///
+
+// Uses a single work group to iteratively propagate a quantum tachyon from S.
+// Returns the number of timelines this process spawns.
+// NOTE: scratch is too large to be in local memory... honestly the real cost
+// here is the global barriers since we're already reading from lookup in global
+// memory frequently. For this problem size it's most likely fine...
+// NB: GWS = LWS, len(scratch) = len(manifold).
+kernel void quantum_propagate(global const uint* lookup,
+                              global const char* manifold, uint2 size,
+                              global ulong* timelines, global ulong* scratch) {
+  // Let's initialize the first splitter with one incoming timeline.
+  for (uint idx = get_local_id(0); idx < size.x; idx += get_local_size(0)) {
+    if (manifold[idx] == 'S') {
+      uint ref = lookup[idx];
+      if (ref < UINT_MAX) scratch[ref] = 1;
+    }
+  }
+  barrier(CLK_GLOBAL_MEM_FENCE);
+
+  ulong ntimelines = 0;
+  // Now let's take iterative passes per row.
+  for (uint y = 0; y < size.y; ++y) {
+    // This time, consider (x, y) to be a place tachyons might spawn,
+    // and propagate the number of such tachyons down to the next splitter.
+    // => Each worker writes to a unique x coord in scratch -> no racing!
+    for (uint x = get_local_id(0); x < size.x; x += get_local_size(0)) {
+      ulong ntachyons = 0;
+      uint idx = linearize2d((uint2)(x, y), size);
+      if (x > 0) {
+        ntachyons += scratch[idx - 1];
+      }
+      if (x + 1 < size.x) {
+        ntachyons += scratch[idx + 1];
+      }
+      if (ntachyons) {
+        uint ref = lookup[idx];
+        if (ref < UINT_MAX)  // Propagate to splitter.
+          scratch[ref] += ntachyons;
+        else  // Mark as output tachyon timeline.
+          ntimelines += ntachyons;
+      }
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+  }
+
+  // Reduce timelines to a final count.
+  ntimelines = work_group_reduce_add(ntimelines);
+  if (!get_local_id(0)) *timelines = ntimelines;
 }
 
 /// 2-Part GS-Count ///
